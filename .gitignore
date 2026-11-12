@@ -1,0 +1,11 @@
+# Secrets: never commit these
+credentials.json
+token.json
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+dist/

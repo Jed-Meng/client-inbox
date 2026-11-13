@@ -256,6 +256,15 @@ async function refreshThread() {
   flag.textContent = thread.needs_reply === null ? "" : !thread.awaiting_me ? "You replied last"
     : thread.needs_reply ? "Needs a reply" : "No reply needed";
 
+  const privacy = thread.privacy || { hidden: {}, unmasked_files: [] };
+  const names = { ssn: "Social Security number", dob: "date of birth", bank: "bank account number", card: "card number", id: "ID number" };
+  const hidden = Object.entries(privacy.hidden).map(([kind, n]) => `${n} ${names[kind] || kind}${n > 1 ? "s" : ""}`);
+  const notes = [];
+  if (hidden.length) notes.push(privacy.on ? `Hidden from Claude: ${hidden.join(", ")}.` : `Masking is off: ${hidden.join(", ")} sent to Claude as written.`);
+  if (privacy.on && privacy.unmasked_files.length) notes.push(`Sent as an image, so nothing in it could be hidden: ${privacy.unmasked_files.join(", ")}.`);
+  $("privacy-note").hidden = !notes.length;
+  $("privacy-note").textContent = notes.join(" ");
+
   const risk = thread.risk || {};
   $("risk-flag").hidden = !risk.active;
   $("risk-box").hidden = !risk.high;

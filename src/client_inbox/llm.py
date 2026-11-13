@@ -8,6 +8,9 @@ Incoming email is untrusted text, so every call runs with:
   --strict-mcp-config   no MCP servers or connectors
   --safe-mode           no user CLAUDE.md, hooks, skills or plugins leaking into the prompt
   an empty working directory, and no saved session
+
+Before any text leaves this computer, privacy.mask replaces Social Security numbers, dates of
+birth, bank and card numbers and ID numbers with placeholders.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import os
 import shutil
 import subprocess
 
-from . import db
+from . import db, privacy
 
 # Which model does which job. Each can be changed with an environment variable.
 MODELS = {
@@ -50,6 +53,9 @@ def run(prompt: str, *, system: str, tier: str = "fast", schema: dict | None = N
     binary = shutil.which("claude")
     if not binary:
         raise LLMError("Claude Code is not installed. Install it and run `claude` once to log in.")
+    # Everything Claude is sent passes through here, so this is where identifiers are hidden.
+    prompt, _ = privacy.mask(prompt)
+    system, _ = privacy.mask(system)
     workdir = db.home() / "llm_cwd"
     workdir.mkdir(exist_ok=True)
     command = [

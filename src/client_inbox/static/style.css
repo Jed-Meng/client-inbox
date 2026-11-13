@@ -133,3 +133,5 @@ nav .count.risk { background: var(--warn); color: #fff; }
 #profile .row { margin-top: 12px; }
 #profile-contacts { list-style: none; padding: 0; margin: 6px 0 0; }
 #profile-contacts li { padding: 3px 0; }
+
+#privacy-note { margin: 8px 0 0; }

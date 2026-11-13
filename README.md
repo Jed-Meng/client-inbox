@@ -142,6 +142,29 @@ Claude's judgment and can miss things; it is a prompt to slow down, not a guaran
   there too.
 - **Files tab**: upload PDF, Word, Excel or text files per client. Claude searches them when drafting.
 
+## Sensitive data masking
+
+Before any text is sent to Claude, the app replaces these on your computer with a placeholder
+such as `[SSN removed]`:
+
+- Social Security numbers and ITINs
+- dates of birth (ordinary dates such as deadlines are left alone)
+- bank routing and account numbers, IBANs
+- payment card numbers
+- driver's license and passport numbers
+
+Your own view of the email is unchanged; only the copy sent to Claude is masked. Under the
+summary, each email shows what was hidden ("Hidden from Claude: 1 Social Security number").
+
+What it does not do:
+- It is pattern matching and catches the common written forms, not every possible one.
+- Pictures and scanned PDFs are sent as images so Claude can read them, so nothing inside them
+  is hidden. The email says so when that happens.
+- Names, addresses, health details and the substance of a complaint are not hidden, because a
+  reply cannot be written without them.
+
+`CLIENT_INBOX_MASK=0` turns masking off.
+
 ## Safety
 
 - Email is untrusted text. Claude runs with every tool switched off (`--tools ""`), no MCP
@@ -198,6 +221,7 @@ drafting model instead. The model that wrote each draft is shown next to "Draft 
 | `extract.py` | PDF, Word, Excel, HTML to text; link extraction; image resizing |
 | `library.py` | Shared reference library and the HR starter pack list |
 | `profile.py` | Per-client facts: learned from mail, edited by the owner |
+| `privacy.py` | Masks identifiers before text is sent to Claude |
 | `demo.py` | The sample inbox behind `client-inbox demo` |
 | `llm.py` | The locked-down `claude -p` call |
 | `static/` | The three-pane screen |
@@ -236,3 +260,7 @@ drafting model instead. The model that wrote each draft is shown next to "Draft 
   high-risk drafts go to Opus with a fallback to Sonnet. 55 tests pass. Live timings: triage 4 to
   9 seconds, normal draft 4 seconds, high-risk draft on Opus 16 seconds; fallback confirmed with a
   deliberately wrong model name.
+- 2026-11-12: added sensitive data masking. 78 tests pass. Live check: Claude was asked to repeat
+  a line containing an SSN, date of birth, routing and account number and returned placeholders
+  for all four with the ordinary date intact; no identifier appeared in the summary or draft of
+  a test email.

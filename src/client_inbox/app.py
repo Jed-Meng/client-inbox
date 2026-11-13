@@ -14,7 +14,7 @@ from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import clients, db, files, gmail, library, llm, pipeline, profile
+from . import clients, db, files, gmail, library, llm, pipeline, privacy, profile
 
 STATIC = Path(__file__).parent / "static"
 MAX_UPLOAD = 20 * 1024 * 1024
@@ -186,6 +186,14 @@ def thread_detail(thread_id: str):
          "text": (row["text"] or "")[:6000], "viewable": bool(row["path"])}
         for row in files.for_thread(thread_id)
     ]
+    file_rows = files.for_thread(thread_id)
+    thread["privacy"] = {
+        "on": privacy.enabled(),
+        "hidden": privacy.count(thread["subject"], *(m["body"] for m in thread["messages"]),
+                                *(row["text"] for row in file_rows)),
+        # Pictures and scans go to Claude as images, so nothing in them can be hidden beforehand.
+        "unmasked_files": [row["name"] for row in file_rows if row["method"] == "ocr"],
+    }
     thread["risk"] = pipeline.risk_of(thread)
     thread["queued"] = f"thread:{thread_id}" in pipeline.WORKER.pending
     thread["gmail_url"] = f"https://mail.google.com/mail/?authuser={quote(db.get_setting('me', ''))}#all/{thread_id}"

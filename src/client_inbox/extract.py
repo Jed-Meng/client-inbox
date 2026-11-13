@@ -10,7 +10,7 @@ TEXT_SUFFIXES = (".txt", ".md", ".csv", ".tsv", ".json", ".log", ".xml", ".yaml"
 
 
 class _HTMLText(HTMLParser):
-    _SKIP = {"script", "style", "head"}
+    _SKIP = {"script", "style", "head", "nav", "footer", "aside", "noscript", "svg", "form", "button"}
     _BREAK = {"p", "br", "div", "tr", "li", "h1", "h2", "h3", "h4", "table", "blockquote"}
 
     def __init__(self) -> None:
@@ -41,11 +41,11 @@ def html_to_text(html: str) -> str:
     return re.sub(r"\n\s*\n\s*", "\n\n", text).strip()
 
 
-def _pdf(data: bytes) -> str:
+def _pdf(data: bytes, max_pages: int = 60) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(data))
-    return "\n\n".join((page.extract_text() or "") for page in reader.pages[:60])
+    return "\n\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
 
 
 def _docx(data: bytes) -> str:
@@ -75,12 +75,13 @@ def _xlsx(data: bytes) -> str:
     return "\n".join(lines)
 
 
-def extract_text(filename: str, data: bytes, mime: str = "") -> str:
-    """Best-effort text for a file. Returns '' for types we cannot read (images, zips)."""
+def extract_text(filename: str, data: bytes, mime: str = "", max_pages: int = 60) -> str:
+    """Best-effort text for a file. Returns '' for types we cannot read (images, zips).
+    PDFs stop at max_pages: 60 for email attachments, far more for reference manuals."""
     name = filename.lower()
     try:
         if name.endswith(".pdf") or mime == "application/pdf":
-            return _pdf(data).strip()
+            return _pdf(data, max_pages).strip()
         if name.endswith(".docx"):
             return _docx(data).strip()
         if name.endswith((".xlsx", ".xlsm")):
@@ -113,3 +114,101 @@ def chunks(text: str, size: int = 1500) -> list[str]:
     if current:
         pieces.append(current)
     return pieces
+
+
+# ---------- links ----------
+
+class _HTMLLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href:
+            self.links.append((self._href.strip(), " ".join("".join(self._text).split())))
+            self._href = None
+
+
+_URL = re.compile(r"https?://[^\s<>\"')\]]+")
+
+
+def links_in(text: str = "", html: str = "") -> list[dict]:
+    """Web links in an email, from the HTML anchors and from bare URLs in the text."""
+    found: dict[str, str] = {}
+    if html:
+        parser = _HTMLLinks()
+        parser.feed(html)
+        for url, label in parser.links:
+            if url.lower().startswith(("http://", "https://")):
+                found.setdefault(url, label)
+    for url in _URL.findall(text or ""):
+        found.setdefault(url.rstrip(".,;:!?"), "")
+    return [{"url": url, "text": label} for url, label in list(found.items())[:40]]
+
+
+# ---------- pictures and scanned PDFs ----------
+
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+
+
+def is_image(filename: str, mime: str = "") -> bool:
+    return mime.startswith("image/") or filename.lower().endswith(IMAGE_SUFFIXES)
+
+
+def is_pdf(filename: str, mime: str = "") -> bool:
+    return mime == "application/pdf" or filename.lower().endswith(".pdf")
+
+
+def prepare_image(data: bytes, longest: int = 1568) -> bytes | None:
+    """Shrink a picture to a size Claude reads well and return it as JPEG. None if unreadable."""
+    try:
+        from PIL import Image, ImageOps
+
+        image = Image.open(io.BytesIO(data))
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        image.thumbnail((longest, longest))
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def pdf_page_count(data: bytes) -> int:
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(io.BytesIO(data)).pages)
+    except Exception:
+        return 0
+
+
+def pdf_first_pages(data: bytes, pages: int = 20) -> bytes:
+    """The first pages of a PDF as a new PDF, so a long scan stays within Claude's limits."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(data))
+    if len(reader.pages) <= pages:
+        return data
+    writer = PdfWriter()
+    for page in reader.pages[:pages]:
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def looks_scanned(text: str, page_count: int) -> bool:
+    """A PDF with almost no text layer is a scan: it needs OCR."""
+    return len(text.strip()) < 40 * max(page_count, 1)

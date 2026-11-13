@@ -51,17 +51,23 @@ def _walk(part: dict):
         yield from _walk(sub)
 
 
-def _body_text(payload: dict) -> str:
-    html = ""
+def _body(payload: dict) -> tuple[str, list[dict]]:
+    """A message's text and the web links in it."""
+    plain = html = ""
     for part in _walk(payload):
         data = part.get("body", {}).get("data")
         if not data or part.get("filename"):
             continue
-        if part.get("mimeType") == "text/plain":
-            return _decode(data)
-        if part.get("mimeType") == "text/html" and not html:
+        if part.get("mimeType") == "text/plain" and not plain:
+            plain = _decode(data)
+        elif part.get("mimeType") == "text/html" and not html:
             html = _decode(data)
-    return extract.html_to_text(html) if html else ""
+    text = plain or (extract.html_to_text(html) if html else "")
+    return text, extract.links_in(text, html)
+
+
+def _body_text(payload: dict) -> str:
+    return _body(payload)[0]
 
 
 def parse_thread(raw: dict, me: set[str]) -> dict | None:
@@ -86,6 +92,7 @@ def parse_thread(raw: dict, me: set[str]) -> dict | None:
             for part in _walk(payload)
             if part.get("filename") and part.get("body", {}).get("attachmentId")
         ]
+        body, links = _body(payload)
         messages.append({
             "id": msg["id"],
             "from_name": from_name or from_email,
@@ -97,7 +104,8 @@ def parse_thread(raw: dict, me: set[str]) -> dict | None:
             "date": int(msg.get("internalDate", 0)) / 1000,
             "message_id": headers.get("message-id", ""),
             "references": headers.get("references", ""),
-            "body": _body_text(payload).strip(),
+            "body": body.strip(),
+            "links": links,
             "attachments": attachments,
             "in_inbox": "INBOX" in labels,
             "is_me": from_email in me,

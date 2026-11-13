@@ -11,6 +11,8 @@
     <strong>Client Inbox</strong>
     <span id="me" class="muted"></span>
     <span id="sync" class="pill"></span>
+    <span id="demo-badge" class="pill demo" hidden>Demo: sample data</span>
+    <button id="demo-btn" hidden title="Make one more sample email arrive">Deliver a sample email</button>
     <span class="spacer"></span>
     <span id="voice" class="muted"></span>
     <button id="voice-btn" class="quiet" title="Re-read your sent mail and relearn how you write">Relearn my voice</button>
@@ -22,19 +24,34 @@
     <section id="middle">
       <div id="client-bar" hidden>
         <h2 id="client-name"></h2>
+        <p id="client-digest" class="muted small"></p>
         <div class="row">
           <button id="tab-threads" class="tab on">Threads</button>
           <button id="tab-files" class="tab">Files</button>
+          <button id="tab-profile" class="tab">Profile</button>
           <span class="spacer"></span>
           <button id="rename-btn" class="quiet">Rename</button>
-          <button id="merge-btn" class="quiet">Merge into…</button>
+          <button id="merge-btn" class="quiet" title="Merge this client into another">Merge</button>
         </div>
       </div>
       <div id="threads"></div>
       <div id="files" hidden>
-        <p class="muted small">Reference files for this client (PDF, Word, Excel, text). Claude searches them when drafting.</p>
+        <div id="library-tools" hidden>
+          <button id="pack-btn" class="primary">Load HR starter pack (California + federal)</button>
+          <p id="pack-status" class="small muted"></p>
+          <ul id="pack-failed" class="small"></ul>
+        </div>
+        <p id="files-hint" class="muted small"></p>
         <input id="file-input" type="file" multiple>
         <ul id="file-list"></ul>
+      </div>
+      <div id="profile" hidden>
+        <p class="muted small">Facts about this client. Claude uses them in every draft to apply the right rules.
+          Fields marked "from email" were picked up automatically; edit anything that is wrong.</p>
+        <form id="profile-form"></form>
+        <div class="row"><button id="profile-save" class="primary">Save profile</button><span id="profile-saved" class="muted small"></span></div>
+        <div class="label" style="margin-top:16px">People who have written in</div>
+        <ul id="profile-contacts" class="small"></ul>
       </div>
       <p id="middle-empty" class="muted pad">Pick a client on the left.</p>
     </section>
@@ -50,8 +67,12 @@
         </div>
 
         <div id="summary-box" class="card">
-          <div class="label">Summary <span id="reply-flag" class="pill"></span></div>
+          <div class="label">Summary <span id="reply-flag" class="pill"></span> <span id="risk-flag" class="pill risk" hidden>High risk</span></div>
           <p id="summary"></p>
+          <div id="risk-box" hidden>
+            <p id="risk-reasons"></p>
+            <button id="risk-btn" class="quiet"></button>
+          </div>
         </div>
 
         <div id="draft-box" class="card">
@@ -68,7 +89,14 @@
           <ul id="sources" class="small"></ul>
         </div>
 
+        <div class="row tabs">
+          <button id="dtab-email" class="tab on">Email</button>
+          <button id="dtab-files" class="tab">Files</button>
+          <span class="spacer"></span>
+          <button id="read-files-btn" class="quiet" hidden>Read files and links</button>
+        </div>
         <div id="messages"></div>
+        <div id="thread-files" hidden></div>
       </div>
     </article>
   </main>

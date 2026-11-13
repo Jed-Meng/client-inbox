@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 
 from . import extract
 from .google_auth import service
@@ -60,3 +61,20 @@ def read_text(item: dict) -> str:
     while not done:
         _, done = downloader.next_chunk()
     return extract.extract_text(name, buffer.getvalue(), mime)
+
+
+_GOOGLE_LINK = re.compile(
+    r"https://(?:docs|drive)\.google\.com/.*?(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})"
+)
+
+
+def file_id_from_url(url: str) -> str | None:
+    """The Drive file id inside a Google Docs, Sheets, Slides or Drive link."""
+    match = _GOOGLE_LINK.match(url)
+    return match.group(1) if match else None
+
+
+def read_by_id(file_id: str) -> tuple[str, str]:
+    """(name, text) for a Drive file the user can open."""
+    item = _drive().files().get(fileId=file_id, fields="id, name, mimeType, size").execute()
+    return item["name"], read_text(item)

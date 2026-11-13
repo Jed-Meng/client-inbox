@@ -41,7 +41,7 @@ create table if not exists threads (
     summary text,
     keywords text,
     triaged_for text,                  -- last_inbound_id the summary was written for
-    status text default 'idle',        -- idle | summarizing | drafting | error
+    status text default 'idle',        -- idle | summarizing | reading | drafting | error
     error text,
     messages_json text
 );
@@ -62,6 +62,26 @@ create table if not exists uploads (
     path text,
     chars integer,
     created_at real
+);
+
+-- Attachments and links found in a thread's emails, with what Claude read from them.
+create table if not exists thread_files (
+    id integer primary key,
+    thread_id text not null,
+    message_id text,
+    kind text not null,                -- attachment | link
+    key text not null,                 -- attachment id or url, unique within the thread
+    name text,
+    url text,
+    mime text,
+    size integer,
+    path text,                         -- local copy of an attachment, for viewing
+    method text,                       -- text | ocr | web | drive
+    text text,
+    summary text,
+    status text default 'pending',     -- pending | reading | ready | skipped | error
+    note text,
+    unique (thread_id, key)
 );
 
 create virtual table if not exists upload_chunks using fts5(body, upload_id unindexed, client_id unindexed);
@@ -88,8 +108,23 @@ def conn() -> sqlite3.Connection:
     con.execute("pragma journal_mode = wal")
     con.execute("pragma busy_timeout = 30000")
     con.executescript(SCHEMA)
+    _migrate(con)
     _local.conn, _local.path = con, path
     return con
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """Add columns that newer versions need to a database made by an older one."""
+    wanted = {
+        "uploads": ("source_url text", "publisher text", "fetched_at real"),
+        "clients": ("profile text",),   # JSON: what is known about the client (see profile.py)
+        "threads": ("risk text",),      # JSON: {"high": bool, "reasons": [...], "dismissed": bool}
+    }
+    for table, columns in wanted.items():
+        have = {row["name"] for row in con.execute(f"pragma table_info({table})")}
+        for column in columns:
+            if column.split()[0] not in have:
+                con.execute(f"alter table {table} add column {column}")
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:

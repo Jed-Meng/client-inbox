@@ -10,10 +10,13 @@ ME = "owner@myfirm.com"
 def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("CLIENT_INBOX_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("CLIENT_INBOX_NO_BACKGROUND", "1")
-    from client_inbox import db
+    from client_inbox import db, pipeline
 
     db.set_setting("me", ME)
     yield
+    while not pipeline.WORKER.jobs.empty():  # jobs a test queued but never ran must not leak into the next
+        pipeline.WORKER.jobs.get()
+    pipeline.WORKER.pending.clear()
 
 
 def b64(text: str) -> str:

@@ -4,13 +4,14 @@ when one is needed. Also the background poller and the single worker that runs C
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import threading
 import time
 import uuid
 
-from . import clients, db, drive, extract, gmail, llm, voice
+from . import clients, db, drive, extract, files, gmail, llm, profile, voice
 
 POLL_SECONDS = 60
 BACKFILL_DAYS = 30
@@ -50,8 +51,34 @@ _TRIAGE_SCHEMA = {
             "description": "3-6 specific search terms (project, product, document or person names) "
                            "for finding related files. No generic words.",
         },
+        "topics": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "2-5 subject-matter phrases for looking up reference material that would help "
+                           "answer the email, in the field's own terms (for example 'final paycheck', "
+                           "'meal period waiver', 'exempt employee salary test'). Empty if none applies.",
+        },
+        "client_facts": profile.FACTS_SCHEMA,
+        "high_risk": {
+            "type": "boolean",
+            "description": "true when the email involves any of: a harassment, discrimination or retaliation "
+                           "complaint; an employee who is pregnant, disabled, injured at work, on or asking "
+                           "for medical or family leave or an accommodation, or who recently complained, and "
+                           "who now faces termination, discipline or a change to pay or schedule; a wage "
+                           "claim, agency charge, audit or subpoena; a lawsuit threat or a letter from an "
+                           "attorney; union activity; a threat of violence. false for routine questions "
+                           "about policy, payroll, hiring, benefits or an ordinary termination, and for "
+                           "mail that is not about employees at all.",
+        },
+        "risk_reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "When high_risk is true: 1-3 short reasons, each under 12 words, naming what in "
+                           "the email triggered it. Empty otherwise.",
+        },
     },
-    "required": ["one_line", "summary", "needs_reply", "keywords"],
+    "required": ["one_line", "summary", "needs_reply", "keywords", "topics", "client_facts", "high_risk",
+                 "risk_reasons"],
 }
 _DRAFT_SCHEMA = {
     "type": "object",
@@ -103,6 +130,9 @@ def store_thread(raw: dict, is_new: bool) -> dict | None:
             parsed["last_inbound_id"], int(is_new), json.dumps(parsed["messages"]),
         ),
     )
+    files.discover(parsed)
+    if client_id:
+        profile.add_contacts(client_id, parsed["messages"], me())
     return parsed
 
 
@@ -146,22 +176,57 @@ def triage(thread_id: str) -> None:
         "automated notifications, calendar responses, marketing, mail where the owner is only cc'd, "
         "and threads that are simply closing out (a bare 'thanks')."
     )
-    result = llm.run(prompt, system=_triage_system(), tier="fast", schema=_TRIAGE_SCHEMA)
+    shelf = db.conn().execute(
+        "select id, filename, publisher from uploads where client_id = 0 order by id"
+    ).fetchall()
+    schema = _TRIAGE_SCHEMA
+    if shelf:
+        prompt += (
+            "\n\nThe owner keeps this reference library. If answering the email calls for rules or facts "
+            "these documents would contain, list the ones to consult.\n<reference_library>\n"
+            + "\n".join(f"L{row['id']}: {row['filename']} ({row['publisher'] or 'own file'})" for row in shelf)
+            + "\n</reference_library>"
+        )
+        schema = {
+            **_TRIAGE_SCHEMA,
+            "properties": {**_TRIAGE_SCHEMA["properties"], "reference_documents": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Ids (L1, L2, ...) of up to 5 library documents worth consulting for this "
+                               "email, most relevant first. Empty when none applies.",
+            }},
+            "required": [*_TRIAGE_SCHEMA["required"], "reference_documents"],
+        }
+    result = llm.run(prompt, system=_triage_system(), tier="fast", schema=schema)
+    known = {row["id"] for row in shelf}
+    picked = [int(m) for item in result.get("reference_documents") or []
+              for m in re.findall(r"\d+", str(item))[:1] if int(m) in known]
+    needs_reply = bool(result.get("needs_reply"))
+    high = needs_reply and bool(result.get("high_risk"))
+    risk = {"high": high, "reasons": [str(r)[:120] for r in (result.get("risk_reasons") or [])[:3]] if high else []}
+    if needs_reply and thread.get("client_id"):  # only real correspondents teach us about a client
+        profile.learn(thread["client_id"], result.get("client_facts") or {}, thread_id)
     db.conn().execute(
         "update threads set one_line = ?, summary = ?, needs_reply = ?, keywords = ?, triaged_for = ?, "
-        "status = 'idle', error = null where id = ?",
+        "risk = ?, status = 'idle', error = null where id = ?",
         (
             str(result.get("one_line", ""))[:200], str(result.get("summary", "")),
-            int(bool(result.get("needs_reply"))), json.dumps(list(result.get("keywords") or [])[:6]),
-            thread["last_inbound_id"], thread_id,
+            int(needs_reply),
+            json.dumps({"names": list(result.get("keywords") or [])[:6],
+                        "topics": list(result.get("topics") or [])[:5],
+                        **({"docs": picked[:5]} if shelf else {})}),
+            thread["last_inbound_id"], json.dumps(risk), thread_id,
         ),
     )
 
 
 # ---------- uploaded files ----------
 
-def add_upload(client_id: int, filename: str, data: bytes) -> dict:
-    text = extract.extract_text(filename, data)
+def add_upload(client_id: int, filename: str, data: bytes, *, text: str | None = None,
+               source_url: str = "", publisher: str = "") -> dict:
+    """Store and index a reference file. client_id 0 is the shared library, searched for every client."""
+    if text is None:
+        text = extract.extract_text(filename, data, max_pages=1500 if client_id == 0 else 60)
     if not text:
         raise ValueError("Could not read any text from that file (PDF, Word, Excel and text files work).")
     safe = re.sub(r"[^A-Za-z0-9._ -]", "_", filename)[-120:] or "file"
@@ -171,13 +236,18 @@ def add_upload(client_id: int, filename: str, data: bytes) -> dict:
     path.write_bytes(data)
     con = db.conn()
     cur = con.execute(
-        "insert into uploads (client_id, filename, path, chars, created_at) values (?, ?, ?, ?, ?)",
-        (client_id, filename, str(path), len(text), time.time()),
+        "insert into uploads (client_id, filename, path, chars, created_at, source_url, publisher, fetched_at) "
+        "values (?, ?, ?, ?, ?, ?, ?, ?)",
+        (client_id, filename, str(path), len(text), time.time(), source_url or None, publisher or None,
+         time.time() if source_url else None),
     )
     for piece in extract.chunks(text):
+        # Library passages carry their document title, so a search for "final wages" finds the
+        # final-wages document even where a passage does not repeat the phrase.
+        body = f"{filename}\n{piece}" if client_id == 0 else piece
         con.execute(
             "insert into upload_chunks (body, upload_id, client_id) values (?, ?, ?)",
-            (piece, cur.lastrowid, client_id),
+            (body, cur.lastrowid, client_id),
         )
     return {"id": cur.lastrowid, "filename": filename, "chars": len(text)}
 
@@ -197,41 +267,98 @@ def delete_upload(upload_id: int) -> None:
         pass
 
 
-def search_uploads(client_id: int, keywords: list[str], limit: int = 6) -> list[dict]:
-    terms = ['"' + re.sub(r'["*]', " ", kw).strip() + '"' for kw in keywords if kw.strip()]
+_STOPWORDS = {
+    "about", "after", "also", "been", "client", "could", "does", "email", "from", "have", "into", "just",
+    "more", "need", "needs", "question", "reply", "should", "some", "than", "that", "their", "them", "then",
+    "there", "they", "this", "what", "when", "where", "which", "will", "with", "would", "your",
+}
+
+
+def search_uploads(client_id: int, keywords: list[str], limit: int = 6, by_word: bool = False,
+                   upload_id: int | None = None) -> list[dict]:
+    """Best-matching passages from a client's files (or the shared library, client_id 0).
+    by_word matches on the individual words of the search phrases, which suits long reference texts."""
+    if by_word:
+        words = {w for kw in keywords for w in re.findall(r"[a-z0-9]{4,}", kw.lower())} - _STOPWORDS
+        terms = ['"' + word + '"' for word in sorted(words)]
+        terms += ['"' + re.sub(r'["*]', " ", kw).strip() + '"' for kw in keywords if " " in kw.strip()]
+    else:
+        terms = ['"' + re.sub(r'["*]', " ", kw).strip() + '"' for kw in keywords if kw.strip()]
     if not terms:
         return []
     rows = db.conn().execute(
-        "select upload_chunks.body as body, uploads.filename as filename, uploads.id as upload_id "
+        "select upload_chunks.body as body, uploads.filename as filename, uploads.id as upload_id, "
+        "uploads.source_url as source_url, uploads.publisher as publisher "
         "from upload_chunks inner join uploads on uploads.id = upload_chunks.upload_id "
-        "where upload_chunks match ? and upload_chunks.client_id = ? order by bm25(upload_chunks) limit ?",
-        (" OR ".join(terms), client_id, limit),
+        "where upload_chunks match ? and upload_chunks.client_id = ? and (? is null or uploads.id = ?) "
+        "order by bm25(upload_chunks) limit ?",
+        (" OR ".join(terms), client_id, upload_id, upload_id, limit),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
 # ---------- draft ----------
 
+def library_passages(topics: list[str], keywords: list[str], docs: list[int] | None = None,
+                     max_docs: int = 5) -> list[dict]:
+    """Passages from the shared reference library.
+
+    When triage picked documents by title (docs), the best passages come from exactly those
+    documents: titles bridge wording gaps a word search misses ("final paycheck" vs "final
+    wages"), and mail that needs no reference material gets none. Without that choice, each
+    topic is looked up on its own so a three-question email gets material for all three."""
+    by_doc: dict[int, dict] = {}
+    if docs is not None:
+        for upload_id in docs[:max_docs]:
+            hits = search_uploads(0, topics + keywords, limit=3, by_word=True, upload_id=upload_id)
+            if not hits:  # no word overlap at all: fall back to the document's opening
+                hits = [dict(row) for row in db.conn().execute(
+                    "select upload_chunks.body as body, uploads.filename as filename, uploads.id as upload_id, "
+                    "uploads.source_url as source_url, uploads.publisher as publisher "
+                    "from upload_chunks inner join uploads on uploads.id = upload_chunks.upload_id "
+                    "where uploads.id = ? and uploads.client_id = 0 order by upload_chunks.rowid limit 2",
+                    (upload_id,),
+                ).fetchall()]
+            if hits:
+                by_doc[upload_id] = {**hits[0], "pieces": [hit["body"] for hit in hits]}
+        return list(by_doc.values())
+    queries = [[topic] for topic in topics] or [keywords]
+    for rank in range(3):  # best hit of every topic first, then the second-best, and so on
+        for query in queries:
+            hits = search_uploads(0, query, limit=3, by_word=True)
+            if rank >= len(hits):
+                continue
+            hit = hits[rank]
+            if hit["upload_id"] not in by_doc and len(by_doc) >= max_docs:
+                continue
+            doc = by_doc.setdefault(hit["upload_id"], {**hit, "pieces": []})
+            if hit["body"] not in doc["pieces"] and len(doc["pieces"]) < 3:
+                doc["pieces"].append(hit["body"])
+    return list(by_doc.values())
+
+
+def search_terms(thread: dict) -> tuple[list[str], list[str], list[int] | None]:
+    """(specific names, subject topics, chosen library documents) from triage. Older rows
+    stored a plain list of names; docs is None when triage ran without seeing the library."""
+    stored = json.loads(thread.get("keywords") or "[]")
+    if isinstance(stored, dict):
+        return list(stored.get("names") or []), list(stored.get("topics") or []), stored.get("docs")
+    return list(stored), [], None
+
+
 def gather_sources(thread: dict) -> list[dict]:
     """Everything the draft may lean on, each with an id the model can cite."""
-    keywords = json.loads(thread.get("keywords") or "[]")
+    keywords, topics, docs = search_terms(thread)
     sources: list[dict] = []
 
     def add(kind: str, title: str, text: str, url: str = "") -> None:
         if text.strip():
             sources.append({"id": f"S{len(sources) + 1}", "kind": kind, "title": title, "url": url, "text": text})
 
-    seen = 0
-    for msg in reversed(thread["messages"]):
-        for att in msg["attachments"]:
-            if seen >= 5 or att["size"] > 15 * 1024 * 1024:
-                continue
-            try:
-                data = gmail.attachment_bytes(msg["id"], att["attachment_id"])
-            except Exception:
-                continue
-            seen += 1
-            add("attachment", att["filename"], extract.extract_text(att["filename"], data, att["mime"])[:8000])
+    for row in files.for_thread(thread["id"]):
+        if row["status"] == "ready" and row["text"]:
+            how = " (read with OCR)" if row["method"] == "ocr" else ""
+            add(row["kind"], (row["name"] or "file") + how, row["text"][:8000], row["url"] or "")
 
     if thread.get("client_id"):
         by_file: dict[str, list[str]] = {}
@@ -240,11 +367,16 @@ def gather_sources(thread: dict) -> list[dict]:
         for filename, pieces in by_file.items():
             add("upload", filename, "\n\n[...]\n\n".join(pieces)[:6000])
 
+    linked = {drive.file_id_from_url(s["url"]) for s in sources if s["url"]}  # already read via its link
     try:
         for item in drive.search(keywords):
-            add("drive", item["name"], drive.read_text(item)[:6000], item.get("webViewLink", ""))
+            if item["id"] not in linked:
+                add("drive", item["name"], drive.read_text(item)[:6000], item.get("webViewLink", ""))
     except Exception:
         pass  # Drive not granted or unreachable: draft without it.
+
+    for doc in library_passages(topics, keywords, docs):
+        add("library", doc["filename"], "\n\n[...]\n\n".join(doc["pieces"])[:5000], doc["source_url"] or "")
 
     if thread.get("client_id"):
         try:
@@ -255,8 +387,28 @@ def gather_sources(thread: dict) -> list[dict]:
     return sources
 
 
-def _draft_system() -> str:
-    profile = db.get_setting("voice_profile", "")
+_HIGH_RISK_RULES = (
+    "This email is flagged HIGH RISK ({reasons}). Write a careful holding reply, not a full answer: "
+    "acknowledge the message and its urgency; say plainly that no adverse step (termination, discipline, "
+    "a cut in hours or pay, denying leave or an accommodation) should be taken until the owner has "
+    "reviewed the facts; list the specific facts and documents the owner needs to see; state a rule only "
+    "where a library source clearly supports it; and where the stakes call for it, say the owner may "
+    "recommend involving employment counsel. Do not approve or recommend the action the sender proposes."
+)
+
+
+def risk_of(thread: dict) -> dict:
+    """{'high', 'reasons', 'dismissed'}; 'active' is true when the flag is on and the owner has not cleared it."""
+    risk = json.loads(thread.get("risk") or "{}") if isinstance(thread.get("risk"), str) else (thread.get("risk") or {})
+    risk = {"high": bool(risk.get("high")), "reasons": list(risk.get("reasons") or []),
+            "dismissed": bool(risk.get("dismissed"))}
+    risk["active"] = risk["high"] and not risk["dismissed"]
+    return risk
+
+
+def _draft_system(thread: dict | None = None) -> str:
+    voice_profile = db.get_setting("voice_profile", "")
+    risk = risk_of(thread or {})
     return "\n\n".join(filter(None, [
         f"You write email replies as {_owner()}, in their own voice, for them to review "
         "before anything is sent.",
@@ -268,7 +420,16 @@ def _draft_system() -> str:
         "write a short [placeholder in square brackets] for the owner to fill in. Sources of kind "
         "past_reply show how the owner writes to this client: copy their style, not their content. "
         "Plain text only, no markdown.",
-        f"How the owner writes:\n{profile}" if profile else "",
+        "Sources of kind library are official reference material. When the reply states a legal, tax or "
+        "compliance rule, take it from a library source and list that source in sources_used. If no "
+        "library source covers the point, do not state the rule from memory as fact: say what needs "
+        "checking in a [verify: ...] placeholder. Do not paste web addresses into the reply; the owner "
+        "sees the source links beside the draft.",
+        db.get_setting("practice_context", "") or "",
+        profile.as_text((thread or {}).get("client_id")),
+        _HIGH_RISK_RULES.format(reasons="; ".join(risk["reasons"]) or "sensitive employment matter")
+        if risk["active"] else "",
+        f"How the owner writes:\n{voice_profile}" if voice_profile else "",
     ]))
 
 
@@ -279,6 +440,8 @@ def write_draft(thread_id: str, instruction: str = "") -> None:
     if thread["triaged_for"] != thread["last_inbound_id"]:
         triage(thread_id)
         thread = load_thread(thread_id)
+    _set_status(thread_id, "reading")
+    files.read_all(thread_id, include_links=True)
     _set_status(thread_id, "drafting")
     sources = gather_sources(thread)
     blocks = [
@@ -291,7 +454,7 @@ def write_draft(thread_id: str, instruction: str = "") -> None:
         + (f"\n\n<instruction_from_owner>\n{instruction.strip()}\n</instruction_from_owner>" if instruction.strip() else "")
         + "\n\nWrite the owner's reply to the newest message from the other party."
     )
-    result = llm.run(prompt, system=_draft_system(), tier="smart", schema=_DRAFT_SCHEMA)
+    result = llm.run(prompt, system=_draft_system(thread), tier="smart", schema=_DRAFT_SCHEMA)
     used = {str(item).strip() for item in result.get("sources_used") or []}
     listed = [
         {"id": s["id"], "kind": s["kind"], "title": s["title"], "url": s["url"], "used": s["id"] in used}
@@ -307,6 +470,12 @@ def write_draft(thread_id: str, instruction: str = "") -> None:
     _set_status(thread_id, "idle")
 
 
+def read_files(thread_id: str, include_links: bool = True, retry: bool = False) -> None:
+    _set_status(thread_id, "reading")
+    files.read_all(thread_id, include_links=include_links, retry=retry)
+    _set_status(thread_id, "idle")
+
+
 def process_thread(thread_id: str) -> None:
     """The routine for mail that arrives after install: summarize, then draft if needed."""
     thread = load_thread(thread_id)
@@ -314,10 +483,14 @@ def process_thread(thread_id: str) -> None:
         return
     if not thread["awaiting_me"]:
         db.conn().execute("update threads set needs_reply = 0 where id = ?", (thread_id,))
+        read_files(thread_id, include_links=False)
         return
     if thread["triaged_for"] != thread["last_inbound_id"]:
         triage(thread_id)
         thread = load_thread(thread_id)
+    # Attachments are always read. Links are opened only for mail that needs a reply, so
+    # newsletters and notifications never cause a visit to anyone's site.
+    read_files(thread_id, include_links=bool(thread["needs_reply"]))
     draft = db.conn().execute("select for_message_id from drafts where thread_id = ?", (thread_id,)).fetchone()
     if thread["needs_reply"] and (draft is None or draft["for_message_id"] != thread["last_inbound_id"]):
         write_draft(thread_id)
@@ -377,10 +550,13 @@ def initial_sync() -> None:
     start = gmail.profile()
     ids = gmail.list_inbox_thread_ids(BACKFILL_DAYS)
     SYNC["total"] = len(ids)
+    demo = os.environ.get("CLIENT_INBOX_DEMO") == "1"  # sample mail is processed straight away
     for thread_id in ids:
         raw = gmail.fetch_thread(thread_id)
         if raw:
-            store_thread(raw, is_new=False)
+            store_thread(raw, is_new=demo)
+            if demo:
+                WORKER.submit(f"thread:{thread_id}", process_thread, thread_id)
         SYNC["done"] += 1
     db.set_setting("history_id", str(start["historyId"]))
     db.set_setting("initial_sync_done", "1")
@@ -414,10 +590,10 @@ def poll_once() -> list[str]:
 
 def background(stop: threading.Event) -> None:
     try:
+        if not db.get_setting("voice_profile"):
+            queue_voice()  # queued first, so the first drafts are already written in the user's voice
         if db.get_setting("initial_sync_done") != "1":
             initial_sync()
-        if not db.get_setting("voice_profile"):
-            queue_voice()
     except Exception as exc:
         SYNC.update(phase="error", error=str(exc)[:400])
     while not stop.is_set():

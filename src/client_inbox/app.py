@@ -14,7 +14,7 @@ from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import clients, db, gmail, llm, pipeline
+from . import clients, db, files, gmail, library, llm, pipeline, profile
 
 STATIC = Path(__file__).parent / "static"
 MAX_UPLOAD = 20 * 1024 * 1024
@@ -79,6 +79,11 @@ def state():
                coalesce(sum(case when threads.needs_reply = 1 and threads.awaiting_me = 1 then 1 else 0 end), 0)
                    as needs_reply,
                max(threads.last_date) as last_date,
+               coalesce(sum(case when threads.needs_reply = 1 and threads.awaiting_me = 1
+                                  and json_extract(threads.risk, '$.high') = 1
+                                  and coalesce(json_extract(threads.risk, '$.dismissed'), 0) = 0
+                             then 1 else 0 end), 0) as high_risk,
+               clients.profile as profile,
                (select count(*) from uploads where uploads.client_id = clients.id) as file_count
         from clients
         left join threads on threads.client_id = clients.id
@@ -94,8 +99,56 @@ def state():
         "voice_ready": bool(db.get_setting("voice_profile")),
         "voice_error": db.get_setting("voice_error", ""),
         "voice_building": "voice" in pipeline.WORKER.pending,
-        "clients": [dict(row) for row in rows],
+        "clients": [_client_row(row) for row in rows],
+        "library": {**library.STATUS, "count": len(library.documents())},
+        "demo": _demo(),
+        "demo_waiting": _demo_module().waiting() if _demo() else 0,
     }
+
+
+def _client_row(row) -> dict:
+    """A client for the left list, with a one-line digest of its profile."""
+    client = dict(row)
+    fields = (json.loads(client.pop("profile") or "{}").get("fields")) or {}
+    bits = []
+    if "employee_count" in fields:
+        bits.append(f"{fields['employee_count']['value']} employees")
+    for key in ("states", "pay_schedule"):
+        if key in fields:
+            bits.append(fields[key]["value"])
+    client["digest"] = " · ".join(bits)
+    return client
+
+
+@app.get("/api/clients/{client_id}/profile")
+def get_profile(client_id: int):
+    data = profile.load(client_id)
+    return {
+        "fields": [
+            {"key": key, "label": label, "hint": hint, **data["fields"].get(key, {"value": "", "by": ""})}
+            for key, label, hint in profile.FIELDS
+        ],
+        "contacts": data["contacts"],
+    }
+
+
+@app.put("/api/clients/{client_id}/profile")
+def put_profile(client_id: int, payload: dict = Body(...)):
+    profile.set_by_user(client_id, payload.get("fields") or {})
+    return get_profile(client_id)
+
+
+@app.post("/api/threads/{thread_id}/risk")
+def set_risk(thread_id: str, payload: dict = Body(...)):
+    """Clear (or restore) the high-risk flag by hand; the draft is rewritten to match."""
+    thread = _thread_or_404(thread_id)
+    risk = pipeline.risk_of(thread)
+    stored = {"high": risk["high"], "reasons": risk["reasons"], "dismissed": bool(payload.get("dismissed"))}
+    db.conn().execute("update threads set risk = ? where id = ?", (json.dumps(stored), thread_id))
+    queued = False
+    if db.conn().execute("select 1 from drafts where thread_id = ?", (thread_id,)).fetchone():
+        queued = pipeline.WORKER.submit(f"thread:{thread_id}", pipeline.write_draft, thread_id, "")
+    return {"queued": queued}
 
 
 @app.get("/api/clients/{client_id}/threads")
@@ -104,6 +157,8 @@ def client_threads(client_id: int):
         """
         select threads.id as id, subject, snippet, last_from, last_date, message_count, awaiting_me,
                needs_reply, one_line, status,
+               case when json_extract(threads.risk, '$.high') = 1
+                         and coalesce(json_extract(threads.risk, '$.dismissed'), 0) = 0 then 1 else 0 end as high_risk,
                case when drafts.thread_id is null then 0 else 1 end as has_draft
         from threads
         left join drafts on drafts.thread_id = threads.id
@@ -119,12 +174,19 @@ def client_threads(client_id: int):
 @app.get("/api/threads/{thread_id}")
 def thread_detail(thread_id: str):
     thread = _thread_or_404(thread_id)
+    files.discover(thread)  # no-op for known files; lists attachments on mail stored by an older version
     draft = db.conn().execute("select * from drafts where thread_id = ?", (thread_id,)).fetchone()
     for msg in thread["messages"]:
         msg["attachments"] = [a["filename"] for a in msg["attachments"]]
     thread["draft"] = (
         {**dict(draft), "sources": json.loads(draft["sources"] or "[]")} if draft else None
     )
+    thread["files"] = [
+        {**{k: row[k] for k in ("id", "kind", "name", "url", "mime", "size", "method", "summary", "status", "note")},
+         "text": (row["text"] or "")[:6000], "viewable": bool(row["path"])}
+        for row in files.for_thread(thread_id)
+    ]
+    thread["risk"] = pipeline.risk_of(thread)
     thread["queued"] = f"thread:{thread_id}" in pipeline.WORKER.pending
     thread["gmail_url"] = f"https://mail.google.com/mail/?authuser={quote(db.get_setting('me', ''))}#all/{thread_id}"
     return thread
@@ -176,6 +238,59 @@ def gmail_draft(thread_id: str, payload: dict = Body(...)):
     return {"gmail_draft_id": draft_id}
 
 
+@app.post("/api/threads/{thread_id}/read-files")
+def read_files(thread_id: str):
+    """Read (or retry) this thread's attachments and links on request."""
+    _thread_or_404(thread_id)
+    queued = pipeline.WORKER.submit(f"thread:{thread_id}", pipeline.read_files, thread_id, True, True)
+    return {"queued": queued}
+
+
+_INLINE_TYPES = {
+    ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
+@app.get("/api/thread-files/{file_id}/content")
+def file_content(file_id: int):
+    """The saved copy of an attachment. Only PDFs and pictures open in the browser; anything
+    else (HTML in particular) is sent as a download so it can never run as a page of this app."""
+    row = db.conn().execute("select name, path from thread_files where id = ?", (file_id,)).fetchone()
+    if row is None or not row["path"] or not Path(row["path"]).is_file():
+        raise HTTPException(404, "File not available")
+    inline = _INLINE_TYPES.get(Path(row["name"] or "").suffix.lower())
+    return FileResponse(
+        row["path"],
+        media_type=inline or "application/octet-stream",
+        filename=row["name"] or "file",
+        content_disposition_type="inline" if inline else "attachment",
+        headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"},
+    )
+
+
+def _demo() -> bool:
+    return os.environ.get("CLIENT_INBOX_DEMO") == "1"
+
+
+def _demo_module():
+    from . import demo
+
+    return demo
+
+
+@app.post("/api/demo/deliver")
+def demo_deliver():
+    """Demo mode only: one more sample email 'arrives'."""
+    if not _demo():
+        raise HTTPException(404, "Not in demo mode")
+    subject = _demo_module().deliver_next()
+    if subject is None:
+        raise HTTPException(400, "No more sample emails.")
+    pipeline.poll_once()
+    return {"subject": subject}
+
+
 @app.post("/api/voice/rebuild")
 def rebuild_voice():
     pipeline.queue_voice()
@@ -224,7 +339,8 @@ def move_thread(thread_id: str, payload: dict = Body(...)):
 @app.get("/api/clients/{client_id}/files")
 def list_files(client_id: int):
     rows = db.conn().execute(
-        "select id, filename, chars, created_at from uploads where client_id = ? order by created_at desc",
+        "select id, filename, chars, created_at, source_url, publisher, fetched_at from uploads "
+        "where client_id = ? order by publisher, created_at desc",
         (client_id,),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -239,6 +355,16 @@ async def upload_file(client_id: int, file: UploadFile = File(...)):
         return pipeline.add_upload(client_id, file.filename or "file", data)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/library/load-hr-pack")
+def load_hr_pack():
+    """Download the free California and federal HR reference set into the shared library."""
+    if library.STATUS["running"]:
+        return {"queued": False}
+    library.STATUS.update(running=True, done=0, total=len(library.HR_PACK), failed=[])
+    threading.Thread(target=library.load_hr_pack, daemon=True).start()
+    return {"queued": True}
 
 
 @app.delete("/api/files/{upload_id}")

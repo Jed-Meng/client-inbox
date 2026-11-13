@@ -38,14 +38,17 @@ def world(monkeypatch):
     monkeypatch.setattr(gmail, "create_draft", fake_create)
     monkeypatch.setattr(gmail, "get_draft", lambda draft_id: {"id": draft_id})
 
-    def fake_llm(prompt, *, system, tier="fast", schema=None, timeout=240):
+    def fake_llm(prompt, *, system, tier="fast", schema=None, timeout=240, attachments=None):
         state["llm_calls"].append({"prompt": prompt, "system": system, "tier": tier})
-        if schema and "needs_reply" in schema["properties"]:
+        fields = schema["properties"] if schema else {}
+        if "needs_reply" in fields:
             promo = "50% off" in prompt
             return {"one_line": "Promo" if promo else "Pat asks for the audit price",
                     "summary": "A sale." if promo else "Pat wants the audit price confirmed.",
                     "needs_reply": not promo, "keywords": ["audit", "PO 7781"]}
-        return {"body": "Hi Pat,\n\nThe audit price is 4200 USD.\n\nJ", "sources_used": ["S1", "S3"]}
+        if "body" in fields:
+            return {"body": "Hi Pat,\n\nThe audit price is 4200 USD.\n\nJ", "sources_used": ["S1", "S3"]}
+        return {"summary": "A purchase order for an audit at 4200 USD."}
 
     monkeypatch.setattr(llm, "run", fake_llm)
     db.set_setting("history_id", "100")
@@ -91,7 +94,12 @@ def test_new_mail_to_gmail_draft(world):
     # The draft prompt carried the attachment text, the Drive file and the voice profile, on the smart model.
     # (Threads are processed in no fixed order, so pick the draft call by its model tier.)
     draft_call = next(call for call in world["llm_calls"] if call["tier"] == "smart")
-    assert [call["tier"] for call in world["llm_calls"]].count("fast") == 2
+    # Fast-model calls: two triage summaries plus one summary of the attachment.
+    assert [call["tier"] for call in world["llm_calls"]].count("fast") == 3
+    files = {f["name"]: f for f in detail["files"]}
+    assert files["po.txt"]["status"] == "ready" and files["po.txt"]["method"] == "text"
+    assert files["po.txt"]["summary"] == "A purchase order for an audit at 4200 USD."
+    assert client.get(f"/api/thread-files/{files['po.txt']['id']}/content").content == b"PO 7781: audit price 4200 USD"
     assert "audit price 4200 USD" in draft_call["prompt"] and "audit due March 3" in draft_call["prompt"]
     assert "signs off with J" in draft_call["system"]
 

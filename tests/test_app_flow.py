@@ -94,8 +94,9 @@ def test_new_mail_to_gmail_draft(world):
     # The draft prompt carried the attachment text, the Drive file and the voice profile, on the smart model.
     # (Threads are processed in no fixed order, so pick the draft call by its model tier.)
     draft_call = next(call for call in world["llm_calls"] if call["tier"] == "smart")
-    # Fast-model calls: two triage summaries plus one summary of the attachment.
-    assert [call["tier"] for call in world["llm_calls"]].count("fast") == 3
+    # Two triage calls on the triage model, one attachment summary on the fast one.
+    tiers = [call["tier"] for call in world["llm_calls"]]
+    assert tiers.count("triage") == 2 and tiers.count("fast") == 1
     files = {f["name"]: f for f in detail["files"]}
     assert files["po.txt"]["status"] == "ready" and files["po.txt"]["method"] == "text"
     assert files["po.txt"]["summary"] == "A purchase order for an audit at 4200 USD."

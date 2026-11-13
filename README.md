@@ -168,8 +168,19 @@ Claude's judgment and can miss things; it is a prompt to slow down, not a guaran
 | `uv run client-inbox logout` | Forget the Google sign-in (local data is kept) |
 | `uv run pytest` | Run the tests |
 
-Settings by environment variable: `CLIENT_INBOX_HOME` (data folder, default `~/.client-inbox`),
-`CLIENT_INBOX_FAST_MODEL` (default `haiku`), `CLIENT_INBOX_SMART_MODEL` (default `sonnet`).
+Settings by environment variable: `CLIENT_INBOX_HOME` (data folder, default `~/.client-inbox`).
+
+### Which model does what
+
+| Job | Model | Setting |
+|---|---|---|
+| Reading attachments and links (OCR, file summaries) | Haiku | `CLIENT_INBOX_FAST_MODEL` |
+| Triage: summary, needs-a-reply, high-risk flag, choosing library documents | Sonnet | `CLIENT_INBOX_TRIAGE_MODEL` |
+| Drafting replies, learning your voice | Sonnet | `CLIENT_INBOX_SMART_MODEL` |
+| Drafting replies to high-risk mail | Opus | `CLIENT_INBOX_CAREFUL_MODEL` |
+
+If the high-risk model is not available on your Claude plan, that draft is written by the normal
+drafting model instead. The model that wrote each draft is shown next to "Draft reply".
 
 ## Files
 
@@ -221,3 +232,7 @@ Settings by environment variable: `CLIENT_INBOX_HOME` (data folder, default `~/.
   profile picked up headcount, state and pay schedule from one email; a pregnancy-plus-complaint
   termination email was flagged with three reasons and got a holding reply; no other sample
   email was flagged.
+- 2026-11-12: model split changed. Triage moved from Haiku to Sonnet (it carries the risk flag);
+  high-risk drafts go to Opus with a fallback to Sonnet. 55 tests pass. Live timings: triage 4 to
+  9 seconds, normal draft 4 seconds, high-risk draft on Opus 16 seconds; fallback confirmed with a
+  deliberately wrong model name.

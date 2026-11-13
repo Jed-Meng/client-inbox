@@ -276,7 +276,8 @@ async function refreshThread() {
     box.value = "";
   }
   $("draft-status").textContent = thread.status === "drafting" ? "writing…"
-    : thread.status === "reading" ? "reading files and links…" : thread.queued ? "queued…" : "";
+    : thread.status === "reading" ? "reading files and links…" : thread.queued ? "queued…"
+    : draft && draft.model ? `written by ${draft.model}` : "";
   $("regen-btn").textContent = draft ? "Regenerate" : "Draft a reply";
   $("regen-btn").disabled = busy || !canReply;
   $("copy-btn").disabled = !box.value.trim();

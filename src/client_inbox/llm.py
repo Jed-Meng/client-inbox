@@ -20,9 +20,16 @@ import subprocess
 
 from . import db
 
+# Which model does which job. Each can be changed with an environment variable.
 MODELS = {
+    # Reading attachments and links: OCR and file summaries. Runs on every file.
     "fast": os.environ.get("CLIENT_INBOX_FAST_MODEL", "haiku"),
+    # Triage: summary, needs-a-reply, the high-risk flag, choosing library documents. Runs on every email.
+    "triage": os.environ.get("CLIENT_INBOX_TRIAGE_MODEL", "sonnet"),
+    # Drafting replies and learning the owner's voice.
     "smart": os.environ.get("CLIENT_INBOX_SMART_MODEL", "sonnet"),
+    # Drafting replies to mail flagged high risk. Falls back to "smart" if this model is not available.
+    "careful": os.environ.get("CLIENT_INBOX_CAREFUL_MODEL", "opus"),
 }
 
 

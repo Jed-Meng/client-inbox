@@ -197,7 +197,7 @@ def triage(thread_id: str) -> None:
             }},
             "required": [*_TRIAGE_SCHEMA["required"], "reference_documents"],
         }
-    result = llm.run(prompt, system=_triage_system(), tier="fast", schema=schema)
+    result = llm.run(prompt, system=_triage_system(), tier="triage", schema=schema)
     known = {row["id"] for row in shelf}
     picked = [int(m) for item in result.get("reference_documents") or []
               for m in re.findall(r"\d+", str(item))[:1] if int(m) in known]
@@ -454,18 +454,28 @@ def write_draft(thread_id: str, instruction: str = "") -> None:
         + (f"\n\n<instruction_from_owner>\n{instruction.strip()}\n</instruction_from_owner>" if instruction.strip() else "")
         + "\n\nWrite the owner's reply to the newest message from the other party."
     )
-    result = llm.run(prompt, system=_draft_system(thread), tier="smart", schema=_DRAFT_SCHEMA)
+    # High-risk mail goes to the most careful model. If the user's Claude plan does not offer it
+    # (or it fails for any reason), the usual drafting model writes the reply instead.
+    tier = "careful" if risk_of(thread)["active"] else "smart"
+    try:
+        result = llm.run(prompt, system=_draft_system(thread), tier=tier, schema=_DRAFT_SCHEMA)
+    except llm.LLMError:
+        if tier == "smart" or llm.MODELS["careful"] == llm.MODELS["smart"]:
+            raise
+        tier = "smart"
+        result = llm.run(prompt, system=_draft_system(thread), tier=tier, schema=_DRAFT_SCHEMA)
     used = {str(item).strip() for item in result.get("sources_used") or []}
     listed = [
         {"id": s["id"], "kind": s["kind"], "title": s["title"], "url": s["url"], "used": s["id"] in used}
         for s in sources
     ]
     db.conn().execute(
-        "insert into drafts (thread_id, body, sources, for_message_id, gmail_draft_id, updated_at) "
-        "values (?, ?, ?, ?, null, ?) on conflict (thread_id) do update set body = excluded.body, "
+        "insert into drafts (thread_id, body, sources, for_message_id, gmail_draft_id, updated_at, model) "
+        "values (?, ?, ?, ?, null, ?, ?) on conflict (thread_id) do update set body = excluded.body, "
         "sources = excluded.sources, for_message_id = excluded.for_message_id, gmail_draft_id = null, "
-        "updated_at = excluded.updated_at",
-        (thread_id, str(result.get("body", "")).strip(), json.dumps(listed), thread["last_inbound_id"], time.time()),
+        "updated_at = excluded.updated_at, model = excluded.model",
+        (thread_id, str(result.get("body", "")).strip(), json.dumps(listed), thread["last_inbound_id"],
+         time.time(), llm.MODELS[tier]),
     )
     _set_status(thread_id, "idle")
 

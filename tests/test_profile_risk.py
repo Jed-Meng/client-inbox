@@ -42,10 +42,11 @@ def test_empty_profile_adds_nothing_to_the_prompt():
 def hr(monkeypatch):
     monkeypatch.setattr(drive, "search", lambda keywords, limit=4: [])
     monkeypatch.setattr(voice, "past_replies", lambda client_id, limit=4: [])
-    calls = {"draft_systems": []}
+    calls = {"draft_systems": [], "draft_tiers": [], "triage_tiers": []}
 
     def fake_llm(prompt, *, system, tier="fast", schema=None, timeout=240, attachments=None):
         if "needs_reply" in schema["properties"]:
+            calls["triage_tiers"].append(tier)
             risky = "pregnant" in prompt
             newsletter = "Unsubscribe" in prompt
             return {"one_line": "x", "summary": "s", "needs_reply": not newsletter, "keywords": [], "topics": [],
@@ -53,6 +54,9 @@ def hr(monkeypatch):
                                      "pay_schedule": "biweekly", "payroll_provider": ""},
                     "high_risk": risky or newsletter,
                     "risk_reasons": ["pregnant employee facing termination"] if risky else []}
+        calls["draft_tiers"].append(tier)
+        if tier == "careful" and calls.get("careful_unavailable"):
+            raise llm.LLMError("model not available on this plan")
         calls["draft_systems"].append(system)
         return {"body": "draft", "sources_used": []}
 
@@ -128,3 +132,24 @@ def test_old_database_gains_profile_and_risk_columns(tmp_path, monkeypatch):
     row = dict(db.conn().execute("select risk, keywords from threads").fetchone())
     assert pipeline.risk_of(row)["active"] is False
     assert pipeline.search_terms(row) == (["audit"], [], None)  # old keyword format still reads
+
+
+def test_each_job_goes_to_its_own_model(hr):
+    hr["arrive"]("t1", "Maya <maya@harbor.example>", "Routine question about our PTO policy.")
+    hr["arrive"]("t2", "Maya <maya@harbor.example>", "She is pregnant and the manager wants to fire her tomorrow.")
+    assert hr["triage_tiers"] == ["triage", "triage"]
+    assert hr["draft_tiers"] == ["smart", "careful"]
+    models = {r["thread_id"]: r["model"] for r in db.conn().execute("select thread_id, model from drafts")}
+    assert models == {"t1": llm.MODELS["smart"], "t2": llm.MODELS["careful"]}
+    assert (llm.MODELS["fast"], llm.MODELS["triage"], llm.MODELS["smart"], llm.MODELS["careful"]) == (
+        "haiku", "sonnet", "sonnet", "opus")
+
+
+def test_high_risk_draft_falls_back_when_the_careful_model_is_unavailable(hr):
+    hr["careful_unavailable"] = True
+    hr["arrive"]("t1", "Maya <maya@harbor.example>", "She is pregnant and the manager wants to fire her tomorrow.")
+    assert hr["draft_tiers"] == ["careful", "smart"]
+    draft = db.conn().execute("select body, model from drafts where thread_id = 't1'").fetchone()
+    assert draft["body"] == "draft" and draft["model"] == llm.MODELS["smart"]
+    assert "HIGH RISK" in hr["draft_systems"][-1]  # still written as a holding reply
+    assert pipeline.load_thread("t1")["status"] == "idle"

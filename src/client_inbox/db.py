@@ -119,6 +119,7 @@ def _migrate(con: sqlite3.Connection) -> None:
         "uploads": ("source_url text", "publisher text", "fetched_at real"),
         "clients": ("profile text",),   # JSON: what is known about the client (see profile.py)
         "threads": ("risk text",),      # JSON: {"high": bool, "reasons": [...], "dismissed": bool}
+        "drafts": ("model text",),      # which model wrote the draft
     }
     for table, columns in wanted.items():
         have = {row["name"] for row in con.execute(f"pragma table_info({table})")}
